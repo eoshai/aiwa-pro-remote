@@ -88,7 +88,7 @@ O app conecta automaticamente ao iniciar. O IP está configurado diretamente no 
 As notificações usam um APK auxiliar próprio (`aiwa-toast`) que precisa ser instalado uma vez na TV.
 
 ### Compilar o APK
-O código-fonte do APK está no repositório [aiwa-toast](https://github.com/SEU_USUARIO/aiwa-toast). O GitHub Actions compila automaticamente — baixe o artefato `aiwa-toast` na aba **Actions**.
+O código-fonte do APK está no repositório [aiwa-toast](https://github.com/eoshai/aiwa-toast). O GitHub Actions compila automaticamente — baixe o artefato `aiwa-toast` na aba **Actions**.
 
 ### Instalar na TV
 ```bash
