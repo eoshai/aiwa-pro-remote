@@ -23,21 +23,37 @@ import os
 import sys
 import re
 import tempfile
+import json
+import base64
+import hashlib
+import socket
 from datetime import datetime
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import messagebox
 
+# Servidor web (Flask) — instalado automaticamente se ausente
+try:
+    from flask import Flask, request, jsonify, send_file, redirect, session, render_template_string
+    FLASK_OK = True
+except ImportError:
+    FLASK_OK = False
+
 # ─────────────────────────────────────────────────────────────────
 #  CONFIGURAÇÕES GLOBAIS
 # ─────────────────────────────────────────────────────────────────
-TV_HOST          = "192.168.0.159"
-TV_PORT          = 5555
+TV_HOST          = "tv ip here"
+TV_PORT          = # port here
 TV_ADDRESS       = f"{TV_HOST}:{TV_PORT}"
 ADB_TIMEOUT      = 8    # timeout padrão de comandos ADB (segundos)
 PING_INTERVAL    = 5    # intervalo do monitor de conexão (segundos)
 RECONNECT_DELAY  = 10   # espera antes de tentar reconectar (segundos)
 STATS_INTERVAL   = 2    # intervalo de atualização de CPU/RAM (segundos)
+
+# Servidor web
+WEB_PORT     = 8080
+WEB_PASSWORD = "your password here"
+WEB_SESSION  = hashlib.sha256(WEB_PASSWORD.encode()).hexdigest()[:16]
 
 # Status de conexão
 STATUS_CONNECTED    = "connected"
@@ -478,6 +494,478 @@ class ScreenshotWindow(ctk.CTkToplevel):
 # MiniBar removida - usando ctk.CTkProgressBar nativo
 
 
+
+# ─────────────────────────────────────────────────────────────────
+#  SERVIDOR WEB  (Flask — acesso pelo celular na rede local)
+# ─────────────────────────────────────────────────────────────────
+# HTML da interface web — responsivo, dark mode, otimizado para celular
+WEB_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>AIWA Remote</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  body{background:#0d0d0f;color:#e8e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;padding-bottom:30px}
+  h3{font-size:10px;font-weight:600;color:#6e6e88;letter-spacing:.08em;padding:14px 16px 6px;text-transform:uppercase}
+  .card{background:#18181f;border:1px solid #2a2a35;border-radius:14px;margin:6px 12px;padding:14px}
+  .status-bar{background:#111116;padding:12px 16px;display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:10;border-bottom:1px solid #2a2a35}
+  .status-bar .title{font-size:15px;font-weight:600;flex:1}
+  .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+  .dot.connected{background:#27ae60}
+  .dot.standby{background:#f39c12}
+  .dot.disconnected{background:#e74c3c}
+  .dot.connecting{background:#4fc3f7}
+  .status-txt{font-size:12px;color:#6e6e88}
+  /* dpad */
+  .dpad{display:grid;grid-template-columns:repeat(3,64px);grid-template-rows:repeat(3,64px);gap:6px;justify-content:center;margin:8px auto}
+  .dpad-btn{background:#1e1e28;border:none;color:#e8e8f0;font-size:20px;border-radius:10px;cursor:pointer;transition:background .1s;display:flex;align-items:center;justify-content:center;width:64px;height:64px}
+  .dpad-btn:active{background:#3a3a50}
+  .dpad-ok{background:#4f8ef7;border-radius:50%;font-size:14px;font-weight:700;color:#fff}
+  .dpad-ok:active{background:#3a7ae8}
+  .dpad-empty{visibility:hidden}
+  /* botoes genericos */
+  .btn-row{display:flex;gap:8px;flex-wrap:wrap}
+  .btn{flex:1;min-width:0;height:44px;border:none;border-radius:10px;background:#1c1c26;color:#e8e8f0;font-size:13px;font-weight:600;cursor:pointer;transition:background .1s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 8px}
+  .btn:active{filter:brightness(1.3)}
+  .btn-home{background:#1a3a2a;color:#7fcfaf}
+  .btn-power{background:#3a0a0a;color:#e74c3c}
+  .btn-vol{background:#1c1c26;font-size:15px}
+  /* apps grid */
+  .apps-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .app-btn{height:52px;border:none;border-radius:10px;font-size:12px;font-weight:700;color:#fff;cursor:pointer;transition:filter .1s}
+  .app-btn:active{filter:brightness(1.3)}
+  /* text input */
+  .text-row{display:flex;gap:8px}
+  .txt-input{flex:1;background:#0a0a0e;border:1px solid #2a2a35;border-radius:10px;color:#e8e8f0;font-size:14px;padding:10px 12px;outline:none}
+  .txt-input:focus{border-color:#4f8ef7}
+  .send-btn{background:#4f8ef7;border:none;border-radius:10px;color:#fff;font-size:13px;font-weight:700;padding:0 16px;cursor:pointer}
+  /* notif */
+  .notif-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .notif-card{border-radius:10px;padding:10px 8px;border:1px solid}
+  .notif-card.toast{background:#0f1f2a;border-color:#1a4060}
+  .notif-card.system{background:#1a1a0f;border-color:#3a3a10}
+  .notif-card.overlay{background:#1a0f1a;border-color:#3a1060}
+  .notif-label{font-size:11px;font-weight:700;margin-bottom:6px}
+  .notif-label.toast{color:#4fc3f7}
+  .notif-label.system{color:#f9ca24}
+  .notif-label.overlay{color:#a29bfe}
+  .notif-btn{width:100%;height:32px;border:none;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer}
+  .notif-btn.toast{background:#1a3a52;color:#4fc3f7}
+  .notif-btn.system{background:#2e2e10;color:#f9ca24}
+  .notif-btn.overlay{background:#2a1040;color:#a29bfe}
+  /* screenshot */
+  #ss-img{width:100%;border-radius:10px;display:none;margin-top:10px}
+  .ss-btn{width:100%;height:44px;background:#1a2a3a;border:none;border-radius:10px;color:#e8e8f0;font-size:13px;font-weight:700;cursor:pointer}
+  /* toast feedback */
+  #feedback{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#27ae60;color:#fff;padding:8px 20px;border-radius:99px;font-size:13px;font-weight:600;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999;white-space:nowrap}
+  /* login */
+  .login-wrap{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+  .login-box{background:#18181f;border:1px solid #2a2a35;border-radius:18px;padding:32px 24px;width:100%;max-width:340px}
+  .login-title{font-size:22px;font-weight:700;margin-bottom:6px}
+  .login-sub{font-size:13px;color:#6e6e88;margin-bottom:24px}
+  .login-input{width:100%;background:#0a0a0e;border:1px solid #2a2a35;border-radius:10px;color:#e8e8f0;font-size:15px;padding:12px 14px;outline:none;margin-bottom:12px}
+  .login-btn{width:100%;height:46px;background:#4f8ef7;border:none;border-radius:10px;color:#fff;font-size:15px;font-weight:700;cursor:pointer}
+  .login-err{color:#e74c3c;font-size:13px;margin-top:8px;display:none}
+</style>
+</head>
+<body>
+{% if not logged_in %}
+<div class="login-wrap">
+  <div class="login-box">
+    <div class="login-title">AIWA Remote</div>
+    <div class="login-sub">Digite a senha para acessar</div>
+    <form method="POST" action="/login">
+      <input class="login-input" type="password" name="password" placeholder="Senha" autofocus>
+      <button class="login-btn" type="submit">Entrar</button>
+      {% if error %}<div class="login-err" style="display:block">Senha incorreta</div>{% endif %}
+    </form>
+  </div>
+</div>
+{% else %}
+<div class="status-bar">
+  <div class="dot {{ conn_status }}" id="dot"></div>
+  <div class="title">AIWA Remote</div>
+  <div class="status-txt" id="status-txt">{{ conn_label }}</div>
+</div>
+
+<h3>Navegacao</h3>
+<div class="card">
+  <div class="dpad">
+    <div class="dpad-empty"></div>
+    <button class="dpad-btn" onclick="key(19)">&#9650;</button>
+    <div class="dpad-empty"></div>
+    <button class="dpad-btn" onclick="key(21)">&#9664;</button>
+    <button class="dpad-btn dpad-ok" onclick="key(66)">OK</button>
+    <button class="dpad-btn" onclick="key(22)">&#9654;</button>
+    <div class="dpad-empty"></div>
+    <button class="dpad-btn" onclick="key(20)">&#9660;</button>
+    <div class="dpad-empty"></div>
+  </div>
+</div>
+
+<h3>Atalhos</h3>
+<div class="card">
+  <div class="btn-row">
+    <button class="btn btn-home" onclick="key(3)">Home</button>
+    <button class="btn" onclick="key(4)">Voltar</button>
+    <button class="btn" onclick="key(82)">Menu</button>
+    <button class="btn" onclick="cmd(\'settings\')">Config</button>
+    <button class="btn btn-power" onclick="key(26)">Power</button>
+  </div>
+</div>
+
+<h3>Volume</h3>
+<div class="card">
+  <div class="btn-row">
+    <button class="btn btn-vol" onclick="key(24)">VOL +</button>
+    <button class="btn btn-vol" onclick="key(164)">MUTE</button>
+    <button class="btn btn-vol" onclick="key(25)">VOL -</button>
+    <button class="btn btn-vol" onclick="key(166)">CH +</button>
+    <button class="btn btn-vol" onclick="key(167)">CH -</button>
+  </div>
+</div>
+
+<h3>Apps</h3>
+<div class="card">
+  <div class="apps-grid">
+    <button class="app-btn" style="background:#FF0000" onclick="app(\'youtube\')">YouTube</button>
+    <button class="app-btn" style="background:#E50914" onclick="app(\'netflix\')">Netflix</button>
+    <button class="app-btn" style="background:#00A8E1" onclick="app(\'prime\')">Prime</button>
+    <button class="app-btn" style="background:#003087" onclick="app(\'globoplay\')">Globoplay</button>
+    <button class="app-btn" style="background:#1DB954" onclick="app(\'spotify\')">Spotify</button>
+    <button class="app-btn" style="background:#003366" onclick="app(\'globo\')">Globo</button>
+    <button class="app-btn" style="background:#01875f" onclick="app(\'playstore\')">Play Store</button>
+    <button class="app-btn" style="background:#607D8B" onclick="app(\'files\')">Arquivos</button>
+    <button class="app-btn" style="background:#455A64" onclick="cmd(\'settings\')">Config.</button>
+  </div>
+</div>
+
+<h3>Texto</h3>
+<div class="card">
+  <div class="text-row" style="margin-bottom:8px">
+    <input class="txt-input" id="txt" type="text" placeholder="Digite o texto...">
+    <button class="send-btn" onclick="sendTxt()">Enviar</button>
+  </div>
+  <div class="btn-row">
+    <button class="btn" onclick="key(67)">Backspace</button>
+    <button class="btn" onclick="key(66)">Enter (TV)</button>
+  </div>
+</div>
+
+<h3>Notificacoes</h3>
+<div class="card">
+  <input class="txt-input" id="notif-title" type="text" placeholder="Titulo (opcional)..." style="width:100%;margin-bottom:8px">
+  <input class="txt-input" id="notif-msg" type="text" placeholder="Mensagem..." style="width:100%;margin-bottom:10px">
+  <div class="notif-cards">
+    <div class="notif-card toast">
+      <div class="notif-label toast">Toast</div>
+      <div style="font-size:10px;color:#6e6e88;margin-bottom:8px">Balao curto</div>
+      <button class="notif-btn toast" onclick="notif(\'toast\')">Enviar</button>
+    </div>
+    <div class="notif-card system">
+      <div class="notif-label system">Sistema</div>
+      <div style="font-size:10px;color:#6e6e88;margin-bottom:8px">Toast longo</div>
+      <button class="notif-btn system" onclick="notif(\'system\')">Enviar</button>
+    </div>
+    <div class="notif-card overlay">
+      <div class="notif-label overlay">Overlay</div>
+      <div style="font-size:10px;color:#6e6e88;margin-bottom:8px">Central</div>
+      <button class="notif-btn overlay" onclick="notif(\'overlay\')">Enviar</button>
+    </div>
+  </div>
+</div>
+
+<h3>Screenshot</h3>
+<div class="card">
+  <button class="ss-btn" onclick="takeScreenshot()">Capturar tela da TV</button>
+  <img id="ss-img" src="" alt="Screenshot">
+</div>
+
+<div id="feedback">OK</div>
+
+<script>
+const show = (msg, ok=true) => {
+  const f = document.getElementById(\'feedback\');
+  f.textContent = msg;
+  f.style.background = ok ? \'#27ae60\' : \'#e74c3c\';
+  f.style.opacity = \'1\';
+  setTimeout(() => f.style.opacity = \'0\', 1500);
+};
+
+const post = async (url, data={}) => {
+  try {
+    const r = await fetch(url, {method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify(data)});
+    const j = await r.json();
+    show(j.ok ? \'OK\' : (j.error || \'Erro\'), j.ok);
+    return j;
+  } catch(e) { show(\'Erro de conexao\', false); }
+};
+
+const key  = k  => post(\'/api/keyevent\', {keycode: k});
+const app  = a  => post(\'/api/app\', {app: a});
+const cmd  = c  => post(\'/api/cmd\', {cmd: c});
+
+const sendTxt = () => {
+  const t = document.getElementById(\'txt\').value.trim();
+  if (!t) return;
+  post(\'/api/text\', {text: t});
+  document.getElementById(\'txt\').value = \'\';
+};
+
+const notif = type => {
+  const title = document.getElementById(\'notif-title\').value.trim() || \'AIWA Remote\';
+  const msg   = document.getElementById(\'notif-msg\').value.trim();
+  if (!msg) { show(\'Digite a mensagem\', false); return; }
+  post(\'/api/notify\', {type, title, message: msg});
+};
+
+const takeScreenshot = async () => {
+  show(\'Capturando...\');
+  const r = await fetch(\'/api/screenshot\');
+  if (r.ok) {
+    const blob = await r.blob();
+    const url  = URL.createObjectURL(blob);
+    const img  = document.getElementById(\'ss-img\');
+    img.src = url;
+    img.style.display = \'block\';
+    show(\'Screenshot ok!\');
+  } else { show(\'Falhou\', false); }
+};
+
+// Atualiza status a cada 5s
+const updateStatus = async () => {
+  try {
+    const r = await fetch(\'/api/status\');
+    const j = await r.json();
+    const dot = document.getElementById(\'dot\');
+    const txt = document.getElementById(\'status-txt\');
+    dot.className = \'dot \' + j.status;
+    const labels = {connected:\'Conectado\',standby:\'Standby\',disconnected:\'Desconectado\',connecting:\'Conectando...\',error:\'Erro\'};
+    txt.textContent = labels[j.status] || j.status;
+  } catch(e) {}
+};
+setInterval(updateStatus, 5000);
+
+// Enter no campo de texto envia
+document.getElementById(\'txt\').addEventListener(\'keydown\', e => { if(e.key===\'Enter\') sendTxt(); });
+document.getElementById(\'notif-msg\').addEventListener(\'keydown\', e => { if(e.key===\'Enter\') notif(\'toast\'); });
+</script>
+{% endif %}
+</body>
+</html>"""
+
+
+class WebServer:
+    """
+    Servidor Flask integrado que expoe a interface web do controle remoto.
+    Roda em thread daemon separada para nao bloquear a GUI.
+    Requer: pip install flask
+    """
+
+    APPS = {
+        "youtube":   ("com.google.android.youtube.tv",
+                      "com.google.android.apps.youtube.tv.activity.ShellActivity"),
+        "netflix":   ("com.netflix.ninja", "com.netflix.ninja.MainActivity"),
+        "prime":     ("com.amazon.amazonvideo.livingroom",
+                      "com.amazon.amazonvideo.livingroom.MainActivity"),
+        "globoplay": ("com.globo.globoplay", ""),
+        "spotify":   ("com.spotify.tv.android",
+                      "com.spotify.tv.android.SpotifyTVActivity"),
+        "globo":     ("com.globo.android", ""),
+        "playstore": ("com.android.vending", ""),
+        "files":     ("com.google.android.documentsui", ""),
+    }
+
+    def __init__(self, adb: "ADBBackend"):
+        self._adb   = adb
+        self._app   = None
+        self._thread = None
+        self._running = False
+        self._last_ss_path = None   # cache do ultimo screenshot
+
+    def start(self):
+        if not FLASK_OK:
+            print("[WebServer] Flask nao instalado — rode: pip install flask")
+            return
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._run, daemon=True, name="web-server"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        app = Flask(__name__)
+        app.secret_key = WEB_SESSION
+
+        # ── autenticacao ──────────────────────────────────────────
+        def is_logged():
+            return session.get("auth") == WEB_SESSION
+
+        @app.route("/login", methods=["GET", "POST"])
+        def login():
+            error = False
+            if request.method == "POST":
+                if request.form.get("password") == WEB_PASSWORD:
+                    session["auth"] = WEB_SESSION
+                    return redirect("/")
+                error = True
+            return render_template_string(
+                WEB_HTML, logged_in=False, error=error,
+                conn_status="disconnected", conn_label=""
+            )
+
+        @app.route("/logout")
+        def logout():
+            session.clear()
+            return redirect("/login")
+
+        # ── pagina principal ──────────────────────────────────────
+        @app.route("/")
+        def index():
+            if not is_logged():
+                return redirect("/login")
+            status = self._adb._status
+            labels = {
+                STATUS_CONNECTED:    "Conectado",
+                STATUS_STANDBY:      "Standby",
+                STATUS_DISCONNECTED: "Desconectado",
+                STATUS_CONNECTING:   "Conectando...",
+                STATUS_ERROR:        "Erro",
+            }
+            return render_template_string(
+                WEB_HTML, logged_in=True, error=False,
+                conn_status=status,
+                conn_label=labels.get(status, status)
+            )
+
+        # ── API: status ───────────────────────────────────────────
+        @app.route("/api/status")
+        def api_status():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            return jsonify({"status": self._adb._status})
+
+        # ── API: keyevent ─────────────────────────────────────────
+        @app.route("/api/keyevent", methods=["POST"])
+        def api_keyevent():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            keycode = request.json.get("keycode")
+            if keycode is None:
+                return jsonify({"ok": False, "error": "keycode missing"})
+            self._adb.send_keyevent(int(keycode))
+            return jsonify({"ok": True})
+
+        # ── API: app launcher ─────────────────────────────────────
+        @app.route("/api/app", methods=["POST"])
+        def api_app():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            app_key = request.json.get("app", "")
+            if app_key not in self.APPS:
+                return jsonify({"ok": False, "error": "app desconhecido"})
+            pkg, act = self.APPS[app_key]
+            self._adb.launch_app(pkg, act, label=app_key)
+            return jsonify({"ok": True})
+
+        # ── API: cmd generico ─────────────────────────────────────
+        @app.route("/api/cmd", methods=["POST"])
+        def api_cmd():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            cmd_key = request.json.get("cmd", "")
+            if cmd_key == "settings":
+                self._adb.send_shell(
+                    "am", "start", "-a", "android.settings.SETTINGS",
+                    label="Configuracoes"
+                )
+            return jsonify({"ok": True})
+
+        # ── API: texto ────────────────────────────────────────────
+        @app.route("/api/text", methods=["POST"])
+        def api_text():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            text = request.json.get("text", "")
+            if not text:
+                return jsonify({"ok": False, "error": "texto vazio"})
+            self._adb.send_text(text)
+            return jsonify({"ok": True})
+
+        # ── API: notificacoes ─────────────────────────────────────
+        @app.route("/api/notify", methods=["POST"])
+        def api_notify():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            data    = request.json
+            ntype   = data.get("type", "toast")
+            title   = data.get("title", "AIWA Remote")
+            message = data.get("message", "")
+            if not message:
+                return jsonify({"ok": False, "error": "mensagem vazia"})
+            if ntype == "toast":
+                self._adb.notify_toast(message)
+            elif ntype == "system":
+                self._adb.notify_system(title, message)
+            elif ntype == "overlay":
+                self._adb.notify_overlay(message)
+            return jsonify({"ok": True})
+
+        # ── API: screenshot ───────────────────────────────────────
+        @app.route("/api/screenshot")
+        def api_screenshot():
+            if not is_logged():
+                return jsonify({"error": "unauthorized"}), 401
+            # Tira screenshot sincrono (bloqueia ate ter o arquivo)
+            result = {"path": None, "done": threading.Event()}
+
+            def _cb():
+                remote = "/sdcard/aiwa_web_ss.png"
+                ok, _  = self._adb._run_adb("shell", "screencap", "-p", remote)
+                if not ok:
+                    result["done"].set()
+                    return
+                tmp = tempfile.mktemp(suffix=".png", prefix="aiwa_web_")
+                ok, _ = self._adb._run_adb("pull", remote, tmp, timeout=15)
+                self._adb._run_adb("shell", "rm", remote)
+                if ok and os.path.exists(tmp):
+                    result["path"] = tmp
+                result["done"].set()
+
+            threading.Thread(target=_cb, daemon=True).start()
+            result["done"].wait(timeout=20)
+
+            if result["path"]:
+                return send_file(result["path"], mimetype="image/png")
+            return jsonify({"error": "screenshot falhou"}), 500
+
+        # Suprime logs do Flask no terminal
+        import logging
+        log = logging.getLogger("werkzeug")
+        log.setLevel(logging.ERROR)
+
+        # Descobre o IP local para exibir no log
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = "localhost"
+
+        print(f"\n{'='*50}")
+        print(f"  AIWA Remote Web  →  http://{local_ip}:{WEB_PORT}")
+        print(f"  Senha: {WEB_PASSWORD}")
+        print(f"{'='*50}\n")
+
+        app.run(host="0.0.0.0", port=WEB_PORT, debug=False, use_reloader=False)
+
+
 # ─────────────────────────────────────────────────────────────────
 #  APLICACAO PRINCIPAL
 # ─────────────────────────────────────────────────────────────────
@@ -519,6 +1007,12 @@ class AIWAProRemote(ctk.CTk):
         self.after(500, self._adb.connect)
         self._poll_queue()
         self.after(1500, self._check_termux)  # verifica Termux ao iniciar
+
+        # Inicia servidor web em background
+        self._web = WebServer(self._adb)
+        if FLASK_OK:
+            self._web.start()
+            self.after(200, self._update_web_indicator)
 
     # ─────────────────────────────────────────────────────────────
     #  BUILD UI
@@ -580,6 +1074,28 @@ class AIWAProRemote(ctk.CTk):
             hover_color=self.C_BTN_HOV, corner_radius=6,
             command=self._adb.connect
         ).pack(side="left")
+
+        # Indicador do servidor web — linha abaixo do cabecalho
+        web_bar = ctk.CTkFrame(hdr, fg_color="#0a0f0a", corner_radius=0)
+        web_bar.grid(row=1, column=0, columnspan=3, sticky="ew", padx=0, pady=0)
+        self._web_lbl = ctk.CTkLabel(
+            web_bar,
+            text="Servidor web: iniciando..." if FLASK_OK else "Servidor web: instale flask  (pip install flask)",
+            font=("Segoe UI", 9),
+            text_color=self.C_TEXT_DIM
+        )
+        self._web_lbl.pack(side="left", padx=14, pady=4)
+
+        if FLASK_OK:
+            import webbrowser
+            self._web_open_btn = ctk.CTkButton(
+                web_bar, text="Abrir no navegador", width=140, height=22,
+                fg_color="transparent", hover_color=self.C_BTN,
+                font=("Segoe UI", 9), text_color="#4fc3f7",
+                command=lambda: webbrowser.open(f"http://localhost:{WEB_PORT}")
+            )
+            self._web_open_btn.pack(side="right", padx=8, pady=4)
+
         return row + 1
 
     # ─────── D-Pad + Volume ──────────────────────────────────────
@@ -1411,11 +1927,33 @@ class AIWAProRemote(ctk.CTk):
         except Exception as e:
             self._log(f"Screenshot erro: {e}")
 
+    def _update_web_indicator(self):
+        """Atualiza o label do servidor web com o IP local."""
+        if not FLASK_OK:
+            return
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            self._web_lbl.configure(
+                text=f"Servidor web ativo  →  http://{ip}:{WEB_PORT}  |  Senha: {WEB_PASSWORD}",
+                text_color="#4fc3f7"
+            )
+        except Exception:
+            self._web_lbl.configure(
+                text=f"Servidor web ativo  →  http://localhost:{WEB_PORT}",
+                text_color="#4fc3f7"
+            )
+
     def on_closing(self):
         self._adb._stop_event.set()
         self._adb.stop_stats()
         if self._scrcpy_proc and self._scrcpy_proc.poll() is None:
             self._scrcpy_proc.terminate()
+        if hasattr(self, "_web"):
+            self._web.stop()
         self.destroy()
 
 
@@ -1433,7 +1971,9 @@ def check_dependencies():
         subprocess.run(["adb", "version"], capture_output=True, timeout=5)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         missing.append("adb (Android Platform Tools)")
-    # scrcpy e opcional — avisa no log, nao bloqueia o inicio
+    # Flask e opcional — servidor web nao inicia sem ele, mas nao bloqueia o app
+    if not FLASK_OK:
+        print("[aviso] Flask nao instalado — servidor web desativado. Rode: pip install flask")
     return missing
 
 
